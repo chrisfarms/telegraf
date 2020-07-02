@@ -32,7 +32,7 @@ func (a *Accumulator) AddEnvelope(env *loggregator_v2.Envelope) {
 		}
 		tags["hostname"] = formatHostname(env)
 		tags["appname"] = tags["app_name"]
-		a.AddFields("cloudfoundry", flds, tags, ts)
+		a.AddFields("syslog", flds, tags, ts)
 	case *loggregator_v2.Envelope_Counter:
 		name := m.Counter.GetName()
 		a.AddCounter("cloudfoundry", map[string]interface{}{
