@@ -24,6 +24,7 @@ func (a *Accumulator) AddEnvelope(env *loggregator_v2.Envelope) {
 	switch m := env.GetMessage().(type) {
 	case *loggregator_v2.Envelope_Log:
 		flds["message"] = env.GetLog().Payload
+		flds["timestamp"] = env.GetTimestamp()
 		flds["facility_code"] = int(1)
 		flds["severity_code"] = formatSeverityCode(env.GetLog().Type)
 		flds["procid"] = formatProcID(
