@@ -17,27 +17,28 @@ func (a *Accumulator) AddEnvelope(env *loggregator_v2.Envelope) {
 	ts := time.Unix(0, env.GetTimestamp()).UTC()
 
 	tags := env.GetTags()
+	flds := map[string]interface{}{}
+
+	tags["host"] = formatHostname(env)
 
 	switch m := env.GetMessage().(type) {
 	case *loggregator_v2.Envelope_Log:
-		flds := map[string]interface{}{
-			"message":       env.GetLog().Payload,
-			"facility_code": int(1),
-			"severity_code": formatSeverity(env.GetLog().Type),
-			"procid": formatProcID(
-				env.Tags["source_type"],
-				env.InstanceId,
-			),
-			"version": int(1),
-		}
-		tags["hostname"] = formatHostname(env)
+		flds["message"] = env.GetLog().Payload
+		flds["facility_code"] = int(1)
+		flds["severity_code"] = formatSeverityCode(env.GetLog().Type)
+		flds["procid"] = formatProcID(
+			env.Tags["source_type"],
+			env.InstanceId,
+		)
+		flds["version"] = int(1)
+		tags["hostname"] = tags["host"]
 		tags["appname"] = tags["app_name"]
+		tags["severity"] = formatSeverityTag(env.GetLog().Type)
+		tags["facility"] = "user"
 		a.AddFields("syslog", flds, tags, ts)
 	case *loggregator_v2.Envelope_Counter:
-		name := m.Counter.GetName()
-		a.AddCounter("cloudfoundry", map[string]interface{}{
-			name: m.Counter.GetTotal(),
-		}, tags, ts)
+		flds[m.Counter.GetName()] = m.Counter.GetTotal()
+		a.AddCounter("cloudfoundry", flds, tags, ts)
 	case *loggregator_v2.Envelope_Gauge:
 		flds := map[string]interface{}{}
 		for name, gauge := range m.Gauge.GetMetrics() {
@@ -53,15 +54,17 @@ func (a *Accumulator) AddEnvelope(env *loggregator_v2.Envelope) {
 		}
 		a.AddFields("cloudfoundry", flds, tags, ts)
 	case *loggregator_v2.Envelope_Event:
-		// ignore events
+		flds["body"] = m.Event.GetBody()
+		flds["title"] = m.Event.GetTitle()
+		a.AddFields("cloudfoundry", flds, tags, ts)
 	default:
-		a.AddError(fmt.Errorf("cannot convert envelope %v to telegraf metric", m))
+		a.AddError(fmt.Errorf("cannot convert envelope %T to telegraf metric", m))
 	}
 
 }
 
-// formatSeverity sets the syslog-compatible severity code based on the log stream
-func formatSeverity(logType loggregator_v2.Log_Type) int {
+// formatSeverityCode sets the syslog-compatible severity code based on the log stream
+func formatSeverityCode(logType loggregator_v2.Log_Type) int {
 	switch logType {
 	case loggregator_v2.Log_OUT:
 		return 6
@@ -69,6 +72,18 @@ func formatSeverity(logType loggregator_v2.Log_Type) int {
 		return 3
 	default:
 		return 5
+	}
+}
+
+// formatSeverity sets the syslog-compatible severity code based on the log stream
+func formatSeverityTag(logType loggregator_v2.Log_Type) string {
+	switch logType {
+	case loggregator_v2.Log_OUT:
+		return "info"
+	case loggregator_v2.Log_ERR:
+		return "err"
+	default:
+		return "info"
 	}
 }
 
