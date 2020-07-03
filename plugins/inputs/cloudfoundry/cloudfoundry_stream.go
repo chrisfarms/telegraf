@@ -10,11 +10,6 @@ import (
 	"github.com/influxdata/telegraf"
 )
 
-type CloudfoundryStream interface {
-	Run(ctx context.Context)
-	Stop()
-}
-
 type StreamConfig struct {
 	SourceID string
 	ShardID  string
@@ -31,7 +26,7 @@ type Stream struct {
 	ctx    context.Context
 	cancel func()
 	StreamConfig
-	*Accumulator
+	EventChan chan *loggregator_v2.Envelope
 	sync.Mutex
 }
 
@@ -41,11 +36,10 @@ func (s *Stream) Run(ctx context.Context) {
 		select {
 		case <-s.ctx.Done():
 			return
-		default:
+		case <-time.After(time.Second * 1): // avoid hammering API on failure
 			req := s.newBatchRequest()
 			events := s.Client.Stream(s.ctx, req)
 			s.send(events)
-			time.Sleep(time.Second * 10) // avoid hammering API on failure
 		}
 	}
 }
@@ -55,27 +49,18 @@ func (s *Stream) Stop() {
 }
 
 func (s *Stream) send(events loggregator.EnvelopeStream) {
-	s.Log.Debugf("started stream for %s", s.SourceID)
-	defer s.Log.Debugf("closed stream for %s", s.SourceID)
+	s.Log.Debugf("stream connected %s", s.SourceID)
+	defer s.Log.Debugf("stream disconnected %s", s.SourceID)
 	for {
-		select {
-		case <-s.ctx.Done():
+		batch := events()
+		if batch == nil {
 			return
-		default:
-			batch := events()
-			if batch == nil {
+		}
+		for _, event := range batch {
+			select {
+			case <-s.ctx.Done():
 				return
-			}
-			for _, event := range batch {
-				select {
-				case <-s.ctx.Done():
-					return
-				default:
-					if event == nil {
-						continue
-					}
-					s.AddEnvelope(event)
-				}
+			case s.EventChan <- event:
 			}
 		}
 	}
