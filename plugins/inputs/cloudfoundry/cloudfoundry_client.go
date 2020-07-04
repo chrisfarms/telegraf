@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"time"
@@ -22,14 +21,14 @@ type CloudfoundryClient interface {
 }
 
 type ClientConfig struct {
-	GatewayAddresss string `toml:"gateway_address"`
-	APIAddress      string `toml:"api_address"`
-	Username        string `toml:"username"`
-	Password        string `toml:"password"`
-	ClientID        string `toml:"client_id"`
-	ClientSecret    string `toml:"client_secret"`
-	Token           string `toml:"token"`
-	TLSSkipVerify   bool   `toml:"insecure_skip_verify"`
+	GatewayAddress string `toml:"gateway_address"`
+	APIAddress     string `toml:"api_address"`
+	Username       string `toml:"username"`
+	Password       string `toml:"password"`
+	ClientID       string `toml:"client_id"`
+	ClientSecret   string `toml:"client_secret"`
+	Token          string `toml:"token"`
+	TLSSkipVerify  bool   `toml:"insecure_skip_verify"`
 }
 
 type Client struct {
@@ -38,8 +37,7 @@ type Client struct {
 	*cfclient.Client
 }
 
-func NewClient(cfg ClientConfig, logger telegraf.Logger) (*Client, error) {
-	errs := make(chan error)
+func NewClient(cfg ClientConfig, logger telegraf.Logger) (CloudfoundryClient, error) {
 	cfClient, err := cfclient.NewClient(&cfclient.Config{
 		ApiAddress:        cfg.APIAddress,
 		Username:          cfg.Username,
@@ -60,21 +58,15 @@ func NewClient(cfg ClientConfig, logger telegraf.Logger) (*Client, error) {
 	c := &Client{
 		Client: cfClient,
 		RLPGatewayClient: loggregator.NewRLPGatewayClient(
-			cfg.GatewayAddresss,
+			cfg.GatewayAddress,
 			loggregator.WithRLPGatewayHTTPClient(&HTTPClient{
 				tokenSource: cfClient.Config.TokenSource,
 				client: &http.Client{
 					Transport: &transport,
 				},
 			}),
-			loggregator.WithRLPGatewayErrChan(errs),
 		),
 	}
-	go func() {
-		for err := range errs {
-			logger.Debugf("rlp error: %s", err)
-		}
-	}()
 	return c, nil
 }
 
@@ -83,8 +75,8 @@ type HTTPClient struct {
 	client      *http.Client
 }
 
-func (l *HTTPClient) Do(req *http.Request) (*http.Response, error) {
-	token, err := getTokenWithRetry(l.tokenSource, 3, 1*time.Second)
+func (c *HTTPClient) Do(req *http.Request) (*http.Response, error) {
+	token, err := c.tokenSource.Token()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token: %s", err)
 	}
@@ -92,28 +84,5 @@ func (l *HTTPClient) Do(req *http.Request) (*http.Response, error) {
 	authHeader := fmt.Sprintf("bearer %s", token.AccessToken)
 	req.Header.Set("Authorization", authHeader)
 
-	return l.client.Do(req)
-}
-
-func getTokenWithRetry(tokenSource oauth2.TokenSource, maxRetries int, fallOffSeconds time.Duration) (*oauth2.Token, error) {
-	var (
-		i     int
-		token *oauth2.Token
-		err   error
-	)
-
-	for i = 0; i < maxRetries; i++ {
-		token, err = tokenSource.Token()
-
-		if err != nil {
-			log.Printf("getting token failed (attempt %d of %d). Retrying. Error: %s", i+1, maxRetries, err.Error())
-
-			sleep := time.Duration(fallOffSeconds.Seconds() * float64(i+1))
-			time.Sleep(sleep)
-			continue
-		}
-		return token, nil
-	}
-
-	return token, err
+	return c.client.Do(req)
 }

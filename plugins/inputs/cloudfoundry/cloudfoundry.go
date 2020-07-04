@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"code.cloudfoundry.org/go-loggregator/v8"
 	"code.cloudfoundry.org/go-loggregator/v8/rpc/loggregator_v2"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
@@ -70,11 +71,7 @@ var usage = `
   ## counters,timers and gauges report application cpu, requests and memory usage
   ## events are platform events
   ## logs will collect log lines into the "syslog" measurement.
-  counters = true
-  timers = true
-  gauges = true
-  events = true
-  logs = true
+  types = ["counters", "timers", "gauges", "events", "logs"]
 `
 
 var (
@@ -87,27 +84,38 @@ const (
 	FirehoseSourceGUID = ""
 )
 
+const (
+	Counter = "counter"
+	Timer   = "timer"
+	Gauge   = "gauge"
+	Event   = "event"
+	Log     = "log"
+)
+
+var (
+	validMetricTypes = []string{Counter, Timer, Gauge, Event, Log}
+)
+
 type Cloudfoundry struct {
 	FirehoseEnabled   bool              `toml:"firehose_enabled"`
 	DiscoveryEnabled  bool              `toml:"discovery_enabled"`
 	DiscoveryInterval internal.Duration `toml:"discovery_interval"`
+	ShardID           string            `toml:"shard_id"`
+	Types             []string          `toml:"types"`
 	ClientConfig
-	StreamConfig
 
-	Log           telegraf.Logger
-	client        CloudfoundryClient
-	ctx           context.Context
-	shutdown      func()
-	acc           telegraf.Accumulator
-	in            chan *loggregator_v2.Envelope
-	streams       map[string]*Stream
-	activeStreams sync.WaitGroup
-	activeWorkers sync.WaitGroup
+	Log      telegraf.Logger
+	client   CloudfoundryClient
+	ctx      context.Context
+	shutdown context.CancelFunc
+	acc      telegraf.Accumulator
+	streams  map[string]context.CancelFunc
+	wg       sync.WaitGroup
 	sync.RWMutex
 }
 
 func (_ *Cloudfoundry) Description() string {
-	return "Read metrics and logs from cloudfoundry platform"
+	return "Consume metrics and logs from cloudfoundry platform"
 }
 
 // SampleConfig returns default configuration example
@@ -120,33 +128,63 @@ func (s *Cloudfoundry) Gather(_ telegraf.Accumulator) error {
 	return nil
 }
 
-// Start connects to cloudfoundry reverse log proxy streams to receive
-// log, gauge, timer, event and counter metrics
-func (s *Cloudfoundry) Start(acc telegraf.Accumulator) (err error) {
-	// create a client
-	client, err := NewClient(s.ClientConfig, s.Log)
-	if err != nil {
-		return err
+// Init validates configuration and sets up the client
+func (s *Cloudfoundry) Init() error {
+	// validate config
+	if s.GatewayAddress == "" {
+		return fmt.Errorf("must provide a valid gateway_address")
 	}
+	if s.APIAddress == "" {
+		return fmt.Errorf("must provide a valid api_address")
+	}
+	if (s.Username == "" || s.Password == "") && (s.ClientID == "" || s.ClientSecret == "") && (s.Token == "") {
+		return fmt.Errorf("must provide either username/password or client_id/client_secret or token authentication")
+	}
+	if !s.FirehoseEnabled && !s.DiscoveryEnabled {
+		return fmt.Errorf("must enable one of firehose_enabled or discovery_enabled")
+	}
+	for _, t := range s.Types {
+		isValid := false
+		for _, validType := range validMetricTypes {
+			if t == validType {
+				isValid = true
+			}
+		}
+		if !isValid {
+			return fmt.Errorf("invalid metric type '%s' must be one of %v", t, validMetricTypes)
+		}
+	}
+	// create a client
+	if s.client == nil {
+		client, err := NewClient(s.ClientConfig, s.Log)
+		if err != nil {
+			return err
+		}
+		s.client = client
+	}
+	return nil
+}
 
+// Start configures client and starts
+func (s *Cloudfoundry) Start(acc telegraf.Accumulator) error {
 	// configure input plugin
 	s.Log.Infof("starting the cloudfoundry service")
 	if s.ShardID == "" {
 		s.ShardID = "telegraf"
 	}
+	if len(s.Types) < 1 {
+		s.Types = validMetricTypes
+	}
 	if s.DiscoveryInterval.Duration < 1 {
 		s.DiscoveryInterval.Duration = time.Second * 60
 	}
-	s.streams = map[string]*Stream{}
+	s.streams = map[string]context.CancelFunc{}
 	s.acc = acc
 	s.ctx, s.shutdown = context.WithCancel(context.Background())
-	s.client = client
-	s.in = make(chan *loggregator_v2.Envelope, 1024)
 
-	// start workers
-	s.activeWorkers.Add(2)
-	go s.readMetricsWorker()
-	go s.writeMetricsWorker()
+	// start stream connection manager
+	s.wg.Add(1)
+	go s.streamConnectionManager()
 
 	return nil
 }
@@ -154,20 +192,16 @@ func (s *Cloudfoundry) Start(acc telegraf.Accumulator) (err error) {
 // Stop shutsdown all streams
 func (s *Cloudfoundry) Stop() {
 	s.Log.Debugf("stopping the cloudfoundry service")
-	defer s.Log.Debugf("stopped the cloudfoundry service")
-	s.Log.Debugf("draining streams")
 	s.shutdown()
-	s.activeStreams.Wait()
-	s.Log.Debugf("draining worker queues")
-	close(s.in)
-	s.activeWorkers.Wait()
+	s.wg.Wait()
+	s.Log.Debugf("stopped the cloudfoundry service")
 }
 
-// readMetricsWorker ensures that relevent metrics streams are connected
-func (s *Cloudfoundry) readMetricsWorker() {
+// streamConnectionManager ensures that relevent metrics streams are connected
+func (s *Cloudfoundry) streamConnectionManager() {
 	s.Log.Debugf("starting metric reader")
 	defer s.Log.Debugf("stopped metric reader")
-	defer s.activeWorkers.Done()
+	defer s.wg.Done()
 
 	delay := time.Second * 0
 	for {
@@ -175,47 +209,24 @@ func (s *Cloudfoundry) readMetricsWorker() {
 		case <-s.ctx.Done():
 			return
 		case <-time.After(delay):
-			if err := s.updateStreams(); err != nil {
-				s.Log.Errorf("update error: %s", err)
-			}
+			s.updateStreams()
 			delay = s.DiscoveryInterval.Duration
 		}
 	}
 }
 
-// writeMetricsWorker reads events as they arrive from streams, convert to
-// telegraf metric and adds to the accumulator
-func (s *Cloudfoundry) writeMetricsWorker() {
-	s.Log.Debugf("starting metric writer")
-	defer s.Log.Debugf("stopped metric writer")
-	defer s.activeWorkers.Done()
-
-	for env := range s.in {
-		if env == nil {
-			continue
-		}
-		m, err := NewMetric(env)
-		if err != nil {
-			s.acc.AddError(err)
-			continue
-		}
-		s.acc.AddMetric(m)
-	}
-}
-
 // updateStreams syncs all active event streams with the environment
-func (s *Cloudfoundry) updateStreams() error {
+func (s *Cloudfoundry) updateStreams() {
 	if s.FirehoseEnabled {
 		if err := s.updateFirehoseStream(); err != nil {
-			return err
+			s.Log.Errorf("failed to update firehose stream: %s", err)
 		}
 	}
 	if s.DiscoveryEnabled {
 		if err := s.updateApplicationStreams(); err != nil {
-			return err
+			s.Log.Errorf("failed to update application streams: %s", err)
 		}
 	}
-	return nil
 }
 
 // updateFirehoseStream connects to rlp stream without source id
@@ -242,10 +253,13 @@ func (s *Cloudfoundry) updateApplicationStreams() error {
 		return fmt.Errorf("application stream discovery failure: %s", err)
 	}
 
-	// fetch active sources
+	// fetch active source ids
 	s.RLock()
 	sourceGUIDs := map[string]bool{}
 	for guid := range s.streams {
+		if guid == FirehoseSourceGUID {
+			continue
+		}
 		sourceGUIDs[guid] = true
 	}
 	s.RUnlock()
@@ -285,30 +299,11 @@ func (s *Cloudfoundry) addStream(sourceGUID string) {
 		return
 	}
 
-	stream := &Stream{
-		Client:    s.client,
-		EventChan: s.in,
-		StreamConfig: StreamConfig{
-			SourceID: sourceGUID,
-			ShardID:  s.ShardID,
-			Counters: s.Counters,
-			Timers:   s.Timers,
-			Gauges:   s.Gauges,
-			Events:   s.Events,
-			Logs:     s.Logs,
-		},
-		Log: s.Log,
-	}
-	s.streams[sourceGUID] = stream
+	ctx, stopStream := context.WithCancel(s.ctx)
+	s.streams[sourceGUID] = stopStream
 
-	s.activeStreams.Add(1)
-	go func() {
-		s.Log.Debugf("stream added %s", sourceGUID)
-		defer s.Log.Debugf("stream removed %s", sourceGUID)
-		defer s.activeStreams.Done()
-		defer s.removeStream(sourceGUID)
-		stream.Run(s.ctx)
-	}()
+	s.wg.Add(1)
+	go s.connectStream(ctx, sourceGUID)
 }
 
 // removeStream stops an event accumulation stream for the given source id
@@ -316,9 +311,106 @@ func (s *Cloudfoundry) removeStream(sourceGUID string) {
 	s.Lock()
 	defer s.Unlock()
 
-	stream, exists := s.streams[sourceGUID]
+	stopStream, exists := s.streams[sourceGUID]
 	if exists {
-		stream.Stop()
+		stopStream()
 		delete(s.streams, sourceGUID)
 	}
+}
+
+// connectStream initiates a connection to the RLP gateway and sends event
+// envelopes to the input chan
+func (s *Cloudfoundry) connectStream(ctx context.Context, sourceGUID string) {
+	s.Log.Debugf("stream added %s", sourceGUID)
+	defer s.Log.Debugf("stream removed %s", sourceGUID)
+	defer s.wg.Done()
+	defer s.removeStream(sourceGUID)
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(time.Second * 1): // avoid hammering API on failure
+			req := s.newBatchRequest(sourceGUID)
+			stream := s.client.Stream(s.ctx, req)
+			s.writeEnvelopes(stream)
+		}
+	}
+}
+
+// writeEnvelopes reads each event envelope from stream and writes to input chan
+func (s *Cloudfoundry) writeEnvelopes(stream loggregator.EnvelopeStream) {
+	for {
+		batch := stream()
+		if batch == nil {
+			return
+		}
+		for _, env := range batch {
+			if env == nil {
+				continue
+			}
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				s.writeEnvelope(env)
+			}
+		}
+	}
+}
+
+// writeEnvelope converts the envelope to telegraf metric and adds to acc
+func (s *Cloudfoundry) writeEnvelope(env *loggregator_v2.Envelope) {
+	m, err := NewMetric(env)
+	if err != nil {
+		s.acc.AddError(err)
+		return
+	}
+	s.acc.AddMetric(m)
+}
+
+// newBatchRequest returns a stream configuration for a given sourceID
+func (s *Cloudfoundry) newBatchRequest(sourceID string) *loggregator_v2.EgressBatchRequest {
+	req := &loggregator_v2.EgressBatchRequest{
+		ShardId: s.ShardID,
+	}
+	for _, t := range s.Types {
+		switch t {
+		case Log:
+			req.Selectors = append(req.Selectors, &loggregator_v2.Selector{
+				SourceId: sourceID,
+				Message: &loggregator_v2.Selector_Log{
+					Log: &loggregator_v2.LogSelector{},
+				},
+			})
+		case Counter:
+			req.Selectors = append(req.Selectors, &loggregator_v2.Selector{
+				SourceId: sourceID,
+				Message: &loggregator_v2.Selector_Counter{
+					Counter: &loggregator_v2.CounterSelector{},
+				},
+			})
+		case Gauge:
+			req.Selectors = append(req.Selectors, &loggregator_v2.Selector{
+				SourceId: sourceID,
+				Message: &loggregator_v2.Selector_Gauge{
+					Gauge: &loggregator_v2.GaugeSelector{},
+				},
+			})
+		case Timer:
+			req.Selectors = append(req.Selectors, &loggregator_v2.Selector{
+				SourceId: sourceID,
+				Message: &loggregator_v2.Selector_Timer{
+					Timer: &loggregator_v2.TimerSelector{},
+				},
+			})
+		case Event:
+			req.Selectors = append(req.Selectors, &loggregator_v2.Selector{
+				SourceId: sourceID,
+				Message: &loggregator_v2.Selector_Event{
+					Event: &loggregator_v2.EventSelector{},
+				},
+			})
+		}
+	}
+	return req
 }

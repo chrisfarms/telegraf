@@ -75,7 +75,12 @@ func NewMetric(env *loggregator_v2.Envelope) (telegraf.Metric, error) {
 		tags["facility"] = "user"
 		return metric.New("syslog", tags, flds, ts, telegraf.Untyped)
 	case *loggregator_v2.Envelope_Counter:
-		flds[m.Counter.Name] = m.Counter.Total
+		if m.Counter.Total > 0 {
+			flds[fmt.Sprintf("%s_total", m.Counter.Name)] = m.Counter.Total
+		}
+		if m.Counter.Delta > 0 {
+			flds[fmt.Sprintf("%s_delta", m.Counter.Name)] = m.Counter.Delta
+		}
 		return metric.New("cloudfoundry", tags, flds, ts, telegraf.Counter)
 	case *loggregator_v2.Envelope_Gauge:
 		flds := map[string]interface{}{}
