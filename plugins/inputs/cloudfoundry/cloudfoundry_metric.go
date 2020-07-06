@@ -10,6 +10,11 @@ import (
 	"github.com/influxdata/telegraf/metric"
 )
 
+const (
+	CloudfoundryMeasurement = "cloudfoundry"
+	SyslogMeasurement       = "syslog"
+)
+
 var (
 	// list of known loggregator envelope tags that suitable
 	// for use as metric tags along with a normalized name
@@ -73,7 +78,7 @@ func NewMetric(env *loggregator_v2.Envelope) (telegraf.Metric, error) {
 		tags["appname"] = tags["app_name"]
 		tags["severity"] = formatSeverityTag(m.Log.Type)
 		tags["facility"] = "user"
-		return metric.New("syslog", tags, flds, ts, telegraf.Untyped)
+		return metric.New(SyslogMeasurement, tags, flds, ts, telegraf.Untyped)
 	case *loggregator_v2.Envelope_Counter:
 		if m.Counter.Total > 0 {
 			flds[fmt.Sprintf("%s_total", m.Counter.Name)] = m.Counter.Total
@@ -81,24 +86,21 @@ func NewMetric(env *loggregator_v2.Envelope) (telegraf.Metric, error) {
 		if m.Counter.Delta > 0 {
 			flds[fmt.Sprintf("%s_delta", m.Counter.Name)] = m.Counter.Delta
 		}
-		return metric.New("cloudfoundry", tags, flds, ts, telegraf.Counter)
+		return metric.New(CloudfoundryMeasurement, tags, flds, ts, telegraf.Counter)
 	case *loggregator_v2.Envelope_Gauge:
-		flds := map[string]interface{}{}
 		for name, gauge := range m.Gauge.Metrics {
 			flds[name] = gauge.Value
 		}
-		return metric.New("cloudfoundry", tags, flds, ts, telegraf.Gauge)
+		return metric.New(CloudfoundryMeasurement, tags, flds, ts, telegraf.Gauge)
 	case *loggregator_v2.Envelope_Timer:
-		flds := map[string]interface{}{
-			fmt.Sprintf("%s_start", m.Timer.Name):    m.Timer.GetStart(),
-			fmt.Sprintf("%s_stop", m.Timer.Name):     m.Timer.GetStop(),
-			fmt.Sprintf("%s_duration", m.Timer.Name): m.Timer.GetStop() - m.Timer.GetStart(),
-		}
-		return metric.New("cloudfoundry", tags, flds, ts, telegraf.Untyped)
+		flds[fmt.Sprintf("%s_start", m.Timer.Name)] = m.Timer.GetStart()
+		flds[fmt.Sprintf("%s_stop", m.Timer.Name)] = m.Timer.GetStop()
+		flds[fmt.Sprintf("%s_duration", m.Timer.Name)] = m.Timer.GetStop() - m.Timer.GetStart()
+		return metric.New(CloudfoundryMeasurement, tags, flds, ts, telegraf.Untyped)
 	case *loggregator_v2.Envelope_Event:
 		flds["body"] = m.Event.GetBody()
 		flds["title"] = m.Event.GetTitle()
-		return metric.New("cloudfoundry", tags, flds, ts, telegraf.Untyped)
+		return metric.New(CloudfoundryMeasurement, tags, flds, ts, telegraf.Untyped)
 	default:
 		return nil, fmt.Errorf("cannot convert envelope %T to telegraf metric", m)
 	}

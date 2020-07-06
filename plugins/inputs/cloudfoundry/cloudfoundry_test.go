@@ -23,7 +23,7 @@ var (
 
 var (
 	// soon is the timeout used for testing async actions that occur quickly
-	soon = time.Second * 2
+	soon = time.Millisecond * 250
 	// tick is the period of checking async assertions
 	tick = time.Millisecond * 100
 )
@@ -187,7 +187,7 @@ func TestRequestedMetricTypes(t *testing.T) {
 
 		err := rec.Start(&testutil.Accumulator{})
 		require.NoError(t, err)
-		// defer rec.Stop()
+		defer rec.Stop()
 
 		require.Eventually(t, func() bool {
 			return fakeClient.StreamCallCount() > 0
@@ -211,10 +211,11 @@ func TestRequestedMetricTypes(t *testing.T) {
 func withFakeClient(c *Cloudfoundry) (*Cloudfoundry, *fakes.FakeCloudfoundryClient) {
 	fakeClient := &fakes.FakeCloudfoundryClient{}
 	fakeClient.ListAppsReturns([]cfclient.App{}, nil)
-	fakeClient.StreamReturns(func() []*loggregator_v2.Envelope {
+	fakeClient.StreamReturnsOnCall(0, func() []*loggregator_v2.Envelope {
 		return []*loggregator_v2.Envelope{}
 	})
 	c.client = fakeClient
 	c.Log = testutil.Logger{}
+	c.RetryInterval.Duration = time.Millisecond * 10
 	return c, fakeClient
 }

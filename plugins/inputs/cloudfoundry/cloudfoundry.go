@@ -47,6 +47,9 @@ var usage = `
   ## Skip verification of TLS certificates (insecure!)
   # insecure_skip_verify = false
 
+  ## retry_interval sets the delay between reconnecting failed stream
+  retry_interval = "1s"
+
   ## Application event source discovery
   ##
   ## When discovery is enabled (default) event source streams will be
@@ -100,6 +103,7 @@ type Cloudfoundry struct {
 	FirehoseEnabled   bool              `toml:"firehose_enabled"`
 	DiscoveryEnabled  bool              `toml:"discovery_enabled"`
 	DiscoveryInterval internal.Duration `toml:"discovery_interval"`
+	RetryInterval     internal.Duration `toml:"retry_interval"`
 	ShardID           string            `toml:"shard_id"`
 	Types             []string          `toml:"types"`
 	ClientConfig
@@ -178,6 +182,9 @@ func (s *Cloudfoundry) Start(acc telegraf.Accumulator) error {
 	if s.DiscoveryInterval.Duration < 1 {
 		s.DiscoveryInterval.Duration = time.Second * 60
 	}
+	if s.RetryInterval.Duration < 1 {
+		s.RetryInterval.Duration = time.Second * 1
+	}
 	s.streams = map[string]context.CancelFunc{}
 	s.acc = acc
 	s.ctx, s.shutdown = context.WithCancel(context.Background())
@@ -199,8 +206,6 @@ func (s *Cloudfoundry) Stop() {
 
 // streamConnectionManager ensures that relevent metrics streams are connected
 func (s *Cloudfoundry) streamConnectionManager() {
-	s.Log.Debugf("starting metric reader")
-	defer s.Log.Debugf("stopped metric reader")
 	defer s.wg.Done()
 
 	delay := time.Second * 0
@@ -325,34 +330,42 @@ func (s *Cloudfoundry) connectStream(ctx context.Context, sourceGUID string) {
 	defer s.Log.Debugf("stream removed %s", sourceGUID)
 	defer s.wg.Done()
 	defer s.removeStream(sourceGUID)
+
+	delay := time.Second * 0
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-time.After(time.Second * 1): // avoid hammering API on failure
+		case <-time.After(delay): // avoid hammering API on failure
 			req := s.newBatchRequest(sourceGUID)
 			stream := s.client.Stream(s.ctx, req)
 			s.writeEnvelopes(stream)
+			delay = s.RetryInterval.Duration
 		}
 	}
 }
 
-// writeEnvelopes reads each event envelope from stream and writes to input chan
+// writeEnvelopes reads each event envelope from stream and writes it to acc
 func (s *Cloudfoundry) writeEnvelopes(stream loggregator.EnvelopeStream) {
 	for {
-		batch := stream()
-		if batch == nil {
+		select {
+		case <-s.ctx.Done():
 			return
-		}
-		for _, env := range batch {
-			if env == nil {
-				continue
-			}
-			select {
-			case <-s.ctx.Done():
+		default:
+			batch := stream()
+			if batch == nil {
 				return
-			default:
-				s.writeEnvelope(env)
+			}
+			for _, env := range batch {
+				if env == nil {
+					continue
+				}
+				select {
+				case <-s.ctx.Done():
+					return
+				default:
+					s.writeEnvelope(env)
+				}
 			}
 		}
 	}
